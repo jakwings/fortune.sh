@@ -1,0 +1,388 @@
+#!/bin/sh
+
+# Copyright (C) 2021 Jak.W https://github.com/jakwings/fortune.sh
+#
+#   TERMS AND CONDITIONS FOR COPYING, DISTRIBUTION AND MODIFICATION
+#
+#  0. You just DO WHAT THE FUCK YOU WANT TO.
+
+set -euf
+
+export LC_ALL=C  # let's count bytes
+
+if [ Darwin = "$(uname 2>/dev/null || true)" ]; then
+  export PATH='/usr/bin:/bin:/usr/sbin:/sbin'  # no slow gnu bloat
+fi
+
+FORTUNE_HOME="${FORTUNE_HOME:-"${HOME}/.config/fortune"}"
+
+# index file format: [header:24][padding:3][total:8+1][index:8+1]...
+INDEX_SIZE=9  # 8 + EOL
+INDEX_SKIP=4  # (24+3 + 8+1) / INDEX_SIZE
+INDEX_FORMAT='%08X'
+INDEX_PATTERN='[0-7][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F]'
+INDEX_MAX="$(( 0x7FFFFFFF - INDEX_SKIP * INDEX_SIZE ))"
+
+help() {
+  printf '%s' 'Usage
+    fortune [options] [database]...
+
+    Extract a quote from fortune databases.
+    Database should be a file or directory.
+    Files in nested directories are skipped.
+    Dot files in directories are also skipped.
+
+Options
+    -h, --help        Show this manual.
+    -e, --equal       Weigh databases equally.
+    -x, --index       Auto-generate index files.
+
+    -w, --weight <number> <database>
+        Add a database of custom weight.
+        The weight is ignored when the -e flag is set.
+        The default weight of other databases becomes zero.
+
+Environment
+    FORTUNE_HOME      The default fortune database.
+'
+}
+
+echo() {
+  printf '%s\n' "$*"
+}
+ekho() {
+  printf '[Error] %s\n' "$*"
+}
+die() {
+  if [ 0 -lt "$#" ]; then ekho "$*" >&2; fi
+  exit 1
+}
+
+case_in() {
+  eval "! case \"\$1\" in (${2:-\"\"}) false; esac"
+}
+shquote() {
+  if [ 0 -lt "$#" ]; then
+    set -- "$*"
+    printf "'"
+    while case_in "$1" "*\\'*"; do
+      set -- "${1#*\'}" "${1%%\'*}"
+      printf '%s' "$2'\\''"
+    done
+    printf '%s' "$1'"
+  fi
+}
+
+is_file() {
+  ! [ -d "$1" ] && [ -e "$1" ]  # disallow broken symlinks
+}
+is_dir() {
+  [ -d "$1" ]  # allow symlinks
+}
+
+# read_dir <dir> <cmd_dfs> [<cmd_bfs>]
+# e.g. read_dir / 'echo "[${FILEPATH}|${SUBPATH}|${FOLDER}|${FILE}]"'
+# to prune dir, make CMD_SKIP non-empty
+read_dir() (
+  set -e +f
+  cd -- "$1"
+  CMD_DFS="$2" CMD_BFS="${3-}" FOLDER="${4-}"; shift "$#"
+  if ! (: [!.]* ..?* .[!.]*); then  # failglob?
+    ! (: [!.]*) || set -- ${1+"$@"} [!.]*
+    ! (: ..?*) || set -- ${1+"$@"} ..?*
+    ! (: .[!.]*) || set -- ${1+"$@"} .[!.]*
+  else
+    set -- [!.]* ..?* .[!.]*
+  fi 2>/dev/null
+  set -f
+  if [ 0 -ge "${#CMD_BFS}" ]; then
+    while [ 0 -lt "$#" ]; do
+      FILE="$1"; shift
+      [ -e "${FILE}" ] || [ -h "${FILE}" ] || continue
+      FILEPATH="${PWD%/}/${FILE}" SUBPATH="${FOLDER:+"${FOLDER}/"}${FILE}"
+      CMD_SKIP=''; eval " ${CMD_DFS} "
+      [ 0 -lt "${#CMD_SKIP}" ] || [ -h "${FILE}" ] || ! [ -d "${FILE}" ] \
+        || read_dir "${FILE}" "${CMD_DFS}" "${CMD_BFS}" "${SUBPATH}"
+    done
+  else
+    CMD_NEXT=''
+    for FILE; do
+      [ -e "${FILE}" ] || [ -h "${FILE}" ] || continue
+      FILEPATH="${PWD%/}/${FILE}" SUBPATH="${FOLDER:+"${FOLDER}/"}${FILE}"
+      CMD_SKIP=''; eval " ${CMD_BFS} "; CMD_NEXT="${CMD_NEXT}0${CMD_SKIP:+1}"
+    done
+    while [ 0 -lt "$#" ]; do
+      FILE="$1"; shift
+      case "${CMD_NEXT}" in
+        (01*) CMD_NEXT="${CMD_NEXT#??}"; continue ;;
+        (*) CMD_NEXT="${CMD_NEXT#?}"
+      esac
+      [ -h "${FILE}" ] || ! [ -d "${FILE}" ] || {
+        SUBPATH="${FOLDER:+"${FOLDER}/"}${FILE}"
+        read_dir "${FILE}" "${CMD_DFS}" "${CMD_BFS}" "${SUBPATH}"
+      }
+    done
+  fi
+)
+
+generate_index() {
+  # traditional header in one line
+  printf '\000\000\000\000'  # version (hack)
+  printf '\000\000\000\000'  # number of quotes
+  printf '\000\000\000\000'  # length of longest quotes
+  printf '\000\000\000\000'  # length of shortest quotes
+  printf '\000\000\000\000'  # flags
+  printf '\000\000\000\000'  # delimiter + reserved
+  printf '\000\000\n'        # padding (hack)
+  # XXX: BSD/MacOS's awk truncates a string at NUL -- make NULs visible!
+  tr '\000' ' ' |
+  awk -v idx_fmt="${INDEX_FORMAT}\\n" -v idx_size="${INDEX_SIZE}" \
+      -v idx_max="${INDEX_MAX}" '
+    BEGIN {
+      if (length(sprintf(idx_fmt, idx_max)) != idx_size) {
+        print "index size mismatched" > "/dev/stderr"
+        exit 1
+      }
+      total = last_pos = pos = ret = 0
+      while (-1 != (ret = (getline line))) {
+        len = length(line) + 1  # XXX: unable to detect missing EOL
+        if (line == "%" || ret == 0) {
+          if (last_pos > idx_max) {
+            print "index overflowed" > "/dev/stderr"  # floating point number
+            exit 1
+          }
+          if (last_pos < pos) {
+            total += 1
+            indexes[total] = last_pos
+          }
+          if (ret == 0) {
+            break
+          }
+          last_pos = pos + len
+        }
+        pos += len
+      }
+      # custom metadata
+      printf idx_fmt, total
+      # indexes
+      for (i = 1; i <= total; ++i) {
+        printf idx_fmt, indexes[i]
+      }
+      exit
+    }
+  '
+}
+
+extract_index() {
+  dd if="$1" \
+     bs="${INDEX_SIZE}" skip="$(( INDEX_SKIP + $2 - 1 ))" count=1 \
+     2>/dev/null
+}
+
+extract_quote() {
+  # XXX: BSD/MacOS's awk truncates a string at NUL -- make NULs visible!
+  # XXX: shell's built-in read requires LF at the end of line
+  dd if="$1" ibs=1 skip="$2" 2>/dev/null \
+    | tr '\000' ' ' | awk -v FS='^\n$' '/^%$/{exit}1'
+}
+
+on_exit() {
+  if [ 0 -ne "$?" ]; then
+    die 'fortune exited abnormally'
+  fi
+}
+trap on_exit EXIT
+
+
+# parse arguments
+#{
+  unset -v flg_equal flg_index flg_weight
+  cfg_weights=''
+
+  arg_n=0 arg_s='' arg_x=''
+  opt_add_db() {
+    eval "arg_$(( arg_n += 1 ))=\"\$1\""
+    arg_s="${arg_s} arg_${arg_n}"
+    arg_x="${arg_x} \"\${arg_${arg_n}}\""
+    if [ 2 -le "$#" ]; then
+      if [ 0 -le "$2" ]; then
+        # remove whitespace and leading zeros (and number sign)
+        cfg_weights="${cfg_weights} $(( ${2#"${2%%[1-9]*}"} + 0 ))"
+      else
+        die "invalid weight: \"$2\""
+      fi
+    else
+      cfg_weights="${cfg_weights} 0"
+    fi
+  }
+
+  arg='' argind=0
+  while [ 0 -lt "$#" ]; do
+    arg="$1"; shift
+    argind="$(( argind + 1 ))"
+    case "${arg}" in
+      (-h|--help) help; exit 0 ;;
+      (-e|--equal) flg_equal=yes ;;
+      (-x|--index) flg_index=yes ;;
+      (-w|--weight)
+        flg_weight=yes
+        [ 1 -le "$#" ] || die "missing weight for option ${arg}"
+        [ 2 -le "$#" ] || die "missing database for option ${arg}"
+        opt_add_db "$2" "$1"; shift 2
+        ;;
+      (--) for arg; do opt_add_db "${arg}"; done; shift "$#" ;;
+      (-?*) die "unrecognized option at #${argind}: \"${arg}\"" ;;
+      (*) opt_add_db "${arg}"
+    esac
+  done
+  if [ 0 -lt "${arg_n}" ]; then
+    eval "set -- ${arg_x}; unset -v ${arg_s}"
+  else
+    set -- "${FORTUNE_HOME}"
+  fi
+  unset -v arg argind arg_n arg_s arg_x
+#}
+
+# select and use only one database randomly according to their weights
+#{
+  if [ '' != "${flg_equal+1}${flg_weight+1}" ]; then
+    idx_file="$(
+      awk -v n="$#" -v equal="${flg_equal+1}" -v numbers="${cfg_weights}" '
+        BEGIN {
+          srand()
+          if (equal) {
+            print int(rand() * n + 1)
+          } else {
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", numbers)
+            split(numbers, weights, /[[:space:]]+/)
+            r = rand(); k = 1; bucket = 0
+            for (i = 1; i <= n; ++i) {
+              if (weights[i] < 0) {
+                weights[i] = 0
+              }
+              if ((bucket += weights[i] * r) >= weights[k]) {
+                bucket -= weights[k]
+                ++k
+              }
+            }
+            print int(0 + weights[k] > 0 ? k : rand() * n + 1)
+          }
+          exit
+        }
+      '
+    )"
+    eval "set -- \"\${${idx_file}}\""
+  fi
+#}
+
+# collect fortune data files
+#{
+  fortunes=''
+  cmd_bfs() {
+    if is_file "${SUBPATH}" && ! case_in "${FILE}" '*.dat|.*'; then
+      printf ' '
+      shquote "${1%/}/${SUBPATH}"
+    fi
+    if is_dir "${SUBPATH}"; then
+      CMD_SKIP=1
+    fi
+  }
+  for file; do
+    if ! case_in "${file}" '.|..|/*|./*|../*|""'; then
+      # avoid "-", "+" or the like at the beginning of filepath
+      file="./${file}"
+    fi
+    if is_file "${file}"; then
+      fortunes="${fortunes} $(shquote "${file}")"
+    elif is_dir "${file}"; then
+      fortunes="${fortunes} $(read_dir "${file}" '' 'cmd_bfs "${file}"')"
+    else
+      if ! [ -e "${file}" ]; then
+        die "could not find \"${file}\""
+      else
+        die "invalid file \"${file}\""
+      fi
+    fi
+  done
+  eval "set -- ${fortunes}"
+#}
+
+# gather the numbers of quotes
+# generate the index files as needed
+#{
+  amounts=''
+  for file; do
+    # use the same extension to ease switching fortune implementations
+    index="${file}.dat"
+    if [ yes = "${flg_index-}" ]; then
+      # In POSIX sh, -nt is undefined.
+      # shellcheck disable=SC3013
+      if ! is_file "${index}" || [ "${file}" -nt "${index}" ] 2>/dev/null; then
+        generate_index <"${file}" >"${index}" || {
+          rm -f -- "${index}" || true
+          die "could not generate index file \"${index}\""
+        }
+      fi
+    else
+      if ! is_file "${index}"; then
+        die "could not find index file \"${index}\""
+      fi
+    fi
+    {
+      if ! { IFS='' read -r line && [ 0 -eq "${#line}" ]; }; then
+        die "found no valid header in \"${index}\""
+      fi
+      if ! {
+        IFS='' read -r line \
+        && case_in "${line}" "${INDEX_PATTERN}" \
+        && [ 1 -eq "$(( INDEX_SIZE == ${#line} + 1 ))" ] \
+        && [ 1 -eq "$(( INDEX_MAX >= 0x${line} ))" ]
+      }; then
+        die "found corrupted data in \"${index}\""
+      fi
+      amounts="${amounts} $(( 0x${line} ))"
+    } <"${index}"
+  done
+#}
+
+# distribute probabilities automatically and randomly select a quote
+#{
+  route="$(
+    awk -v n="$#" -v numbers="${amounts}" '
+      BEGIN {
+        srand()
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", numbers)
+        split(numbers, amounts, /[[:space:]]+/)
+        r = rand(); k = 1; bucket = 0
+        for (i = 1; i <= n; ++i) {
+          if (amounts[i] < 0) {
+            amounts[i] = 0
+          }
+          if ((bucket += amounts[i] * r) >= amounts[k]) {
+            bucket -= amounts[k]
+            ++k
+          }
+        }
+        print (0 + amounts[k] > 0 ? k "-" int(bucket + 1) : "0-0")
+        exit
+      }
+    '
+  )"
+  idx_file="${route%-*}"
+  idx_quote="${route#*-}"
+  if [ 0 -lt "${idx_file}" ] && [ 0 -lt "${idx_quote}" ]; then
+    eval "file=\"\${${idx_file}}\""
+    index="${file}.dat"
+    if ! {
+      pos="$(extract_index "${index}" "${idx_quote}")" \
+      && case_in "${pos}" "${INDEX_PATTERN}" \
+      && [ 1 -eq "$(( INDEX_SIZE == ${#pos} + 1 ))" ] \
+      && [ 1 -eq "$(( INDEX_MAX >= 0x${pos} ))" ]
+    }; then
+      die "found no valid index in \"${index}\""
+    fi
+    extract_quote "${file}" "$(( 0x${pos} ))"
+  else
+    die 'no cookies found'
+  fi
+#}
