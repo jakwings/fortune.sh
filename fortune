@@ -80,51 +80,6 @@ is_dir() {
   [ -d "$1" ]  # allow symlinks
 }
 
-# read_dir <dir> <cmd_dfs> [<cmd_bfs>]
-# e.g. read_dir / 'echo "[${FILEPATH}|${SUBPATH}|${FOLDER}|${FILE}]"'
-# to prune dir, make CMD_SKIP non-empty
-read_dir() (
-  set -e +f
-  cd -- "$1"
-  CMD_DFS="$2" CMD_BFS="${3-}" FOLDER="${4-}"; shift "$#"
-  if ! (: [!.]* ..?* .[!.]*); then  # failglob?
-    ! (: [!.]*) || set -- ${1+"$@"} [!.]*
-    ! (: ..?*) || set -- ${1+"$@"} ..?*
-    ! (: .[!.]*) || set -- ${1+"$@"} .[!.]*
-  else
-    set -- [!.]* ..?* .[!.]*
-  fi 2>/dev/null
-  set -f
-  if [ 0 -ge "${#CMD_BFS}" ]; then
-    while [ 0 -lt "$#" ]; do
-      FILE="$1"; shift
-      [ -e "${FILE}" ] || [ -h "${FILE}" ] || continue
-      FILEPATH="${PWD%/}/${FILE}" SUBPATH="${FOLDER:+"${FOLDER}/"}${FILE}"
-      CMD_SKIP=''; eval " ${CMD_DFS} "
-      [ 0 -lt "${#CMD_SKIP}" ] || [ -h "${FILE}" ] || ! [ -d "${FILE}" ] \
-        || read_dir "${FILE}" "${CMD_DFS}" "${CMD_BFS}" "${SUBPATH}"
-    done
-  else
-    CMD_NEXT=''
-    for FILE; do
-      [ -e "${FILE}" ] || [ -h "${FILE}" ] || continue
-      FILEPATH="${PWD%/}/${FILE}" SUBPATH="${FOLDER:+"${FOLDER}/"}${FILE}"
-      CMD_SKIP=''; eval " ${CMD_BFS} "; CMD_NEXT="${CMD_NEXT}0${CMD_SKIP:+1}"
-    done
-    while [ 0 -lt "$#" ]; do
-      FILE="$1"; shift
-      case "${CMD_NEXT}" in
-        (01*) CMD_NEXT="${CMD_NEXT#??}"; continue ;;
-        (*) CMD_NEXT="${CMD_NEXT#?}"
-      esac
-      [ -h "${FILE}" ] || ! [ -d "${FILE}" ] || {
-        SUBPATH="${FOLDER:+"${FOLDER}/"}${FILE}"
-        read_dir "${FILE}" "${CMD_DFS}" "${CMD_BFS}" "${SUBPATH}"
-      }
-    done
-  fi
-)
-
 generate_index() {
   # traditional header in one line
   printf '\000\000\000\000'  # version (hack)
@@ -278,15 +233,6 @@ trap on_exit EXIT
 # collect fortune data files
 #{
   fortunes=''
-  cmd_bfs() {
-    if is_file "${SUBPATH}" && ! case_in "${FILE}" '*.dat|.*'; then
-      printf ' '
-      shquote "${1%/}/${SUBPATH}"
-    fi
-    if is_dir "${SUBPATH}"; then
-      CMD_SKIP=1
-    fi
-  }
   for file; do
     if ! case_in "${file}" '.|..|/*|./*|../*|""'; then
       # avoid "-", "+" or the like at the beginning of filepath
@@ -295,7 +241,15 @@ trap on_exit EXIT
     if is_file "${file}"; then
       fortunes="${fortunes} $(shquote "${file}")"
     elif is_dir "${file}"; then
-      fortunes="${fortunes} $(read_dir "${file}" '' 'cmd_bfs "${file}"')"
+      fortunes="${fortunes} $(
+        set -e +f
+        (: "${file%/}"/*) || exit 0  # failglob?
+        for f in "${file%/}"/*; do
+          if is_file "${f}" && ! case_in "${f##*/}" '.*|*.dat'; then
+            printf ' '; shquote "${f}"
+          fi
+        done
+      )"
     else
       if ! [ -e "${file}" ]; then
         die "could not find \"${file}\""
