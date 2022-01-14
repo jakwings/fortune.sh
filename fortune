@@ -128,17 +128,19 @@ generate_index() {
   '
 }
 
+dd() {
+  command dd ${1+"$@"} 2>/dev/null || die 'dd exited abnormally'
+}
+
 extract_index() {
-  dd if="$1" \
-     bs="${INDEX_SIZE}" skip="$(( INDEX_SKIP + $2 - 1 ))" count=1 \
-     2>/dev/null
+  dd if="$1" ibs="${INDEX_SIZE}" skip="$(( INDEX_SKIP + ($2) - 1 ))" count=1
 }
 
 extract_quote() {
   # XXX: BSD/MacOS's awk truncates a string at NUL -- make NULs visible!
   # XXX: shell's built-in read requires LF at the end of line
-  dd if="$1" ibs=1 skip="$2" 2>/dev/null \
-    | tr '\000' ' ' | awk -v FS='^\n$' '/^%$/{exit}1'
+  dd if="$1" ibs=1 skip="$2" | tr '\000' ' ' \
+    | awk 'BEGIN{FS="^\n$"} /^%$/{exit} {print} END{exit NR<1}'
 }
 
 on_exit() {
@@ -196,6 +198,7 @@ trap on_exit EXIT
     set -- "${FORTUNE_HOME}"
   fi
   unset -v arg argind arg_n arg_s arg_x
+  unset -f opt_add_db
 #}
 
 # select and use only one database randomly according to their weights
